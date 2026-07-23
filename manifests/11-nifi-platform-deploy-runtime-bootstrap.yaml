@@ -249,23 +249,33 @@ data:
       raise last_error
 
     def set_processor_state(entity, state):
-      entity = api("GET", f"/processors/{entity['id']}")
-      if entity["component"].get("state") == state:
-        return entity
-      api(
-        "PUT",
-        f"/processors/{entity['id']}/run-status",
-        {
-          "revision": revision(entity),
-          "state": state,
-          "disconnectedNodeAcknowledged": False,
-        },
-      )
-      for _ in range(60):
-        current = api("GET", f"/processors/{entity['id']}")
-        if current["component"].get("state") == state:
-          return current
+      last_error = None
+      transition_state = {"RUNNING": "STARTING", "STOPPED": "STOPPING"}.get(state)
+      for _ in range(120):
+        entity = api("GET", f"/processors/{entity['id']}")
+        current_state = entity["component"].get("state")
+        if current_state == state:
+          return entity
+        if current_state == transition_state:
+          time.sleep(1)
+          continue
+        try:
+          api(
+            "PUT",
+            f"/processors/{entity['id']}/run-status",
+            {
+              "revision": revision(entity),
+              "state": state,
+              "disconnectedNodeAcknowledged": False,
+            },
+          )
+        except RuntimeError as exc:
+          last_error = exc
+          if "HTTP 409" not in str(exc):
+            raise
         time.sleep(1)
+      if last_error:
+        raise last_error
       raise RuntimeError(f"Processor {entity['component']['name']} did not reach {state}.")
 
     def set_controller_service_state(entity, state):
