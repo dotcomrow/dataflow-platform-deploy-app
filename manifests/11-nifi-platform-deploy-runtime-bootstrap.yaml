@@ -191,6 +191,16 @@ data:
         },
       )
 
+    def controller_service_has_properties(entity, property_specs):
+      entity = api("GET", f"/controller-services/{entity['id']}")
+      component = entity["component"]
+      descriptors = component.get("descriptors", {})
+      properties = component.get("properties") or {}
+      for candidates, value in property_specs:
+        if properties.get(descriptor_key(descriptors, candidates)) != value:
+          return False
+      return True
+
     def configure_processor(entity, property_specs, auto_terminated=None, dynamic_property_specs=None):
       entity = api("GET", f"/processors/{entity['id']}")
       config = entity["component"].get("config", {})
@@ -239,15 +249,29 @@ data:
       entity = api("GET", f"/controller-services/{entity['id']}")
       if entity["component"].get("state") == state:
         return entity
-      api(
-        "PUT",
-        f"/controller-services/{entity['id']}/run-status",
-        {
-          "revision": revision(entity),
-          "state": state,
-          "disconnectedNodeAcknowledged": False,
-        },
-      )
+      last_error = None
+      for _ in range(60):
+        entity = api("GET", f"/controller-services/{entity['id']}")
+        if entity["component"].get("state") == state:
+          return entity
+        try:
+          api(
+            "PUT",
+            f"/controller-services/{entity['id']}/run-status",
+            {
+              "revision": revision(entity),
+              "state": state,
+              "disconnectedNodeAcknowledged": False,
+            },
+          )
+          break
+        except RuntimeError as exc:
+          last_error = exc
+          if "HTTP 409" not in str(exc):
+            raise
+          time.sleep(1)
+      else:
+        raise last_error
       for _ in range(60):
         current = api("GET", f"/controller-services/{entity['id']}")
         if current["component"].get("state") == state:
@@ -376,19 +400,24 @@ data:
 
       for processor in processors:
         set_processor_state(processor, "STOPPED")
-      set_controller_service_state(kafka_service, "DISABLED")
 
-      kafka_service = configure_controller_service(
-        kafka_service,
-        [
-          (["bootstrap.servers", "Bootstrap Servers"], KAFKA_BOOTSTRAP_SERVERS),
-          (["security.protocol", "Security Protocol"], KAFKA_SECURITY_PROTOCOL),
-          (["sasl.mechanism", "SASL Mechanism"], KAFKA_SASL_MECHANISM),
-          (["sasl.username", "SASL Username"], read_kafka_secret("nifi_username")),
-          (["sasl.password", "SASL Password"], "#{nifi_password}"),
-        ],
-      )
-      kafka_service = set_controller_service_state(kafka_service, "ENABLED")
+      kafka_service_match_properties = [
+        (["bootstrap.servers", "Bootstrap Servers"], KAFKA_BOOTSTRAP_SERVERS),
+        (["security.protocol", "Security Protocol"], KAFKA_SECURITY_PROTOCOL),
+        (["sasl.mechanism", "SASL Mechanism"], KAFKA_SASL_MECHANISM),
+        (["sasl.username", "SASL Username"], read_kafka_secret("nifi_username")),
+      ]
+      kafka_service_properties = kafka_service_match_properties + [
+        (["sasl.password", "SASL Password"], "#{nifi_password}"),
+      ]
+      kafka_service = api("GET", f"/controller-services/{kafka_service['id']}")
+      if (
+        kafka_service["component"].get("state") != "ENABLED"
+        or not controller_service_has_properties(kafka_service, kafka_service_match_properties)
+      ):
+        set_controller_service_state(kafka_service, "DISABLED")
+        kafka_service = configure_controller_service(kafka_service, kafka_service_properties)
+        kafka_service = set_controller_service_state(kafka_service, "ENABLED")
 
       consume = configure_processor(
         consume,
