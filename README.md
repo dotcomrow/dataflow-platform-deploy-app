@@ -4,11 +4,11 @@ Production NiFi flow app for platform application deployment orchestration.
 
 Flow ownership:
 
-1. Consume `batch.platform.deploy.requests.v1`.
+1. Consume prepared deployment requests from `batch.platform.deploy.prepared.v1`.
 2. Extract the platform app deployment operation metadata.
 3. Mark the operation as running through `platform-deploy-service`.
-4. Submit the platform deployment Flink batch job.
-5. Route orchestration failures to `batch.platform.deploy.requests.dlq.v1`.
+4. Provide the NiFi process group where the long-running deployment orchestration steps will be added.
+5. Route orchestration failures to `batch.platform.deploy.prepared.dlq.v1`.
 
 The app references the shared `dataflow/nifi-external` NiFi cluster but does
 not own that cluster or its TLS auth secret.
@@ -27,7 +27,7 @@ Required Vault values before first production sync:
 - `secret/data/kafka-nifi-password#value`
 - `secret/data/platform-deploy-service#token`
 
-This project only defines and configures the NiFi orchestration flow. The
-platform deploy service still needs to publish deployment requests to Kafka, and
-the platform deployment Flink job still needs to own the deployment execution
-logic.
+This project defines and configures the NiFi orchestration handoff. The platform
+deploy service submits the preparation job to Flink, and that Flink job publishes
+prepared deployment requests for this flow to consume. The Terraform/Cloudflare
+execution processors still need to be added to this flow.

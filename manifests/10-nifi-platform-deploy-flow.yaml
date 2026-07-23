@@ -38,22 +38,14 @@ spec:
       value: SASL_PLAINTEXT
     - name: platform.kafka.sasl.mechanism
       value: SCRAM-SHA-256
-    - name: platform.deploy.request.topic
-      value: batch.platform.deploy.requests.v1
+    - name: platform.deploy.prepared.topic
+      value: batch.platform.deploy.prepared.v1
     - name: platform.deploy.dlq.topic
-      value: batch.platform.deploy.requests.dlq.v1
+      value: batch.platform.deploy.prepared.dlq.v1
     - name: platform.deploy.consumer.group
-      value: nifi-platform-deploy-v1
+      value: nifi-platform-deploy-prepared-v1
     - name: platform.deploy.service.url
       value: http://platform-deploy-service.directus.svc.cluster.local:8080
-    - name: platform.deploy.flink.rest.url
-      value: http://flink-rest.kafka.svc.cluster.local:8081
-    - name: platform.deploy.flink.jar.id
-      value: platform-deploy-flink-job.jar
-    - name: platform.deploy.flink.entry.class
-      value: com.suncoast.platform.deploy.flink.PlatformDeployJob
-    - name: platform.deploy.flink.parallelism
-      value: "1"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -86,17 +78,6 @@ data:
           "name": "mark-platform-operation-running",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.service.url}/internal/operations/${platform.operation_id}/start",
-          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
-        },
-        {
-          "name": "build-platform-flink-run-request",
-          "type": "org.apache.nifi.processors.standard.ReplaceText",
-          "relationships": ["success", "failure"]
-        },
-        {
-          "name": "submit-platform-deploy-flink-job",
-          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
-          "url": "#{platform.deploy.flink.rest.url}/jars/#{platform.deploy.flink.jar.id}/run",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {

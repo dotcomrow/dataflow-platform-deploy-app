@@ -408,9 +408,42 @@ data:
         },
       )
 
+    def delete_connection_by_name(process_group_id, name):
+      for connection in list_connections(process_group_id):
+        if connection.get("component", {}).get("name") == name:
+          api(
+            "DELETE",
+            f"/connections/{connection['id']}?version={connection['revision']['version']}&clientId={CLIENT_ID}",
+          )
+
+    def delete_processor_by_name(process_group_id, name):
+      processor = find_by_name(list_processors(process_group_id), name)
+      if not processor:
+        return
+      processor = set_processor_state(processor, "STOPPED")
+      api(
+        "DELETE",
+        f"/processors/{processor['id']}?version={processor['revision']['version']}&clientId={CLIENT_ID}",
+      )
+
+    def remove_stale_flink_submit_path(process_group_id):
+      for connection_name in (
+        "running-original-to-build-flink-run-request",
+        "flink-request-to-submit-platform-deploy-job",
+        "flink-request-failures-to-platform-deploy-dlq",
+        "flink-submit-failures-to-platform-deploy-dlq",
+      ):
+        delete_connection_by_name(process_group_id, connection_name)
+      for processor_name in (
+        "submit-platform-deploy-flink-job",
+        "build-platform-flink-run-request",
+      ):
+        delete_processor_by_name(process_group_id, processor_name)
+
     def main():
       wait_for_cluster()
       process_group_id = ensure_process_group()
+      remove_stale_flink_submit_path(process_group_id)
 
       kafka_service = ensure_controller_service(process_group_id)
       consume = ensure_processor(
@@ -445,22 +478,6 @@ data:
         900,
         0,
       )
-      build_flink_request = ensure_processor(
-        process_group_id,
-        "build-platform-flink-run-request",
-        "org.apache.nifi.processors.standard.ReplaceText",
-        "nifi-standard-nar",
-        1200,
-        0,
-      )
-      submit_flink = ensure_processor(
-        process_group_id,
-        "submit-platform-deploy-flink-job",
-        "org.apache.nifi.processors.standard.InvokeHTTP",
-        "nifi-standard-nar",
-        1500,
-        0,
-      )
       dlq = ensure_processor(
         process_group_id,
         "publish-platform-deploy-dlq",
@@ -475,8 +492,6 @@ data:
         extract_metadata,
         set_auth,
         mark_running,
-        build_flink_request,
-        submit_flink,
         dlq,
       )
 
@@ -514,7 +529,7 @@ data:
         [
           (["Kafka Connection Service"], kafka_service["id"]),
           (["Group ID"], "#{platform.deploy.consumer.group}"),
-          (["Topics"], "#{platform.deploy.request.topic}"),
+          (["Topics"], "#{platform.deploy.prepared.topic}"),
           (["auto.offset.reset", "Auto Offset Reset"], "earliest"),
         ],
       )
@@ -533,6 +548,8 @@ data:
           ("platform.operation_type", "$.operation_type"),
           ("platform.sequence", "$.sequence"),
           ("platform.deployment_strategy", "$.deployment_strategy"),
+          ("platform.prepared_at", "$.prepared_at"),
+          ("platform.prepared_by", "$.prepared_by"),
         ],
       )
       set_auth = configure_processor(
@@ -552,29 +569,6 @@ data:
           (["Response Generation Required", "Always Output Response"], "true"),
           (["Socket Read Timeout"], "60 sec"),
         ],
-        ["Response"],
-      )
-      build_flink_request = configure_processor(
-        build_flink_request,
-        [
-          (["Replacement Strategy"], "Always Replace"),
-          (
-            ["Replacement Value"],
-            "{\"entryClass\":\"#{platform.deploy.flink.entry.class}\",\"parallelism\":#{platform.deploy.flink.parallelism},\"programArgs\":\"--operation-id ${platform.operation_id:escapeJson()} --app-id ${platform.app_id:escapeJson()} --operation-type ${platform.operation_type:escapeJson()} --platform-deploy-service-url #{platform.deploy.service.url} --source nifi\"}",
-          ),
-          (["Evaluation Mode"], "Entire text"),
-        ],
-      )
-      submit_flink = configure_processor(
-        submit_flink,
-        [
-          (["HTTP Method"], "POST"),
-          (["HTTP URL", "Remote URL"], "#{platform.deploy.flink.rest.url}/jars/#{platform.deploy.flink.jar.id}/run"),
-          (["Request Body Enabled", "Send Message Body"], "true"),
-          (["Request Content-Type", "Content-Type"], "application/json"),
-          (["Response Generation Required", "Always Output Response"], "true"),
-          (["Socket Read Timeout"], "120 sec"),
-        ],
         ["Original", "Response"],
       )
       dlq = configure_processor(
@@ -590,16 +584,10 @@ data:
       ensure_connection(process_group_id, "metadata-to-set-platform-deploy-auth", extract_metadata["id"], set_auth["id"], ["matched"])
       ensure_connection(process_group_id, "metadata-failures-to-platform-deploy-dlq", extract_metadata["id"], dlq["id"], ["failure", "unmatched"])
       ensure_connection(process_group_id, "auth-to-mark-platform-operation-running", set_auth["id"], mark_running["id"], ["success"])
-      ensure_connection(process_group_id, "running-original-to-build-flink-run-request", mark_running["id"], build_flink_request["id"], ["Original"])
       ensure_connection(process_group_id, "running-failures-to-platform-deploy-dlq", mark_running["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
-      ensure_connection(process_group_id, "flink-request-to-submit-platform-deploy-job", build_flink_request["id"], submit_flink["id"], ["success"])
-      ensure_connection(process_group_id, "flink-request-failures-to-platform-deploy-dlq", build_flink_request["id"], dlq["id"], ["failure"])
-      ensure_connection(process_group_id, "flink-submit-failures-to-platform-deploy-dlq", submit_flink["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
 
       for processor in (
         dlq,
-        submit_flink,
-        build_flink_request,
         mark_running,
         set_auth,
         extract_metadata,

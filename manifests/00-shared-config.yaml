@@ -9,14 +9,10 @@ data:
   kafka_bootstrap_servers: "kafka.kafka.svc.internal.lan:9092"
   kafka_security_protocol: "SASL_PLAINTEXT"
   kafka_sasl_mechanism: "SCRAM-SHA-256"
-  request_topic: "batch.platform.deploy.requests.v1"
-  dlq_topic: "batch.platform.deploy.requests.dlq.v1"
-  consumer_group: "nifi-platform-deploy-v1"
+  prepared_topic: "batch.platform.deploy.prepared.v1"
+  dlq_topic: "batch.platform.deploy.prepared.dlq.v1"
+  consumer_group: "nifi-platform-deploy-prepared-v1"
   platform_deploy_service_url: "http://platform-deploy-service.directus.svc.cluster.local:8080"
-  flink_rest_url: "http://flink-rest.kafka.svc.cluster.local:8081"
-  flink_jar_id: "platform-deploy-flink-job.jar"
-  flink_entry_class: "com.suncoast.platform.deploy.flink.PlatformDeployJob"
-  flink_parallelism: "1"
 ---
 apiVersion: v1
 kind: Secret
@@ -42,3 +38,104 @@ metadata:
 type: Opaque
 stringData:
   platform_deploy_service_token: "<path:secret/data/platform-deploy-service#token>"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: platform-deploy-kafka-topics
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "52"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform-deploy-kafka-topics
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: topic-bootstrap
+          image: apache/kafka:3.9.0
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_bootstrap_servers
+            - name: KAFKA_SECURITY_PROTOCOL
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_security_protocol
+            - name: KAFKA_SASL_MECHANISM
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_sasl_mechanism
+            - name: KAFKA_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: platform-deploy-kafka-credentials
+                  key: admin_username
+            - name: KAFKA_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-deploy-kafka-credentials
+                  key: admin_password
+            - name: PLATFORM_DEPLOY_PREPARED_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: prepared_topic
+            - name: PLATFORM_DEPLOY_DLQ_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: dlq_topic
+          command: ["/bin/bash", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              CLIENT_CFG="/tmp/kafka-admin.properties"
+              cat > "${CLIENT_CFG}" <<EOF_KAFKA
+              security.protocol=${KAFKA_SECURITY_PROTOCOL}
+              sasl.mechanism=${KAFKA_SASL_MECHANISM}
+              sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="${KAFKA_ADMIN_USERNAME}" password="${KAFKA_ADMIN_PASSWORD}";
+              EOF_KAFKA
+
+              until /opt/kafka/bin/kafka-topics.sh \
+                --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
+                --command-config "${CLIENT_CFG}" \
+                --list >/dev/null 2>&1; do
+                sleep 5
+              done
+
+              ensure_topic() {
+                local topic="$1"
+                if /opt/kafka/bin/kafka-topics.sh \
+                  --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
+                  --command-config "${CLIENT_CFG}" \
+                  --list | grep -qx "${topic}"; then
+                  echo "Topic already exists: ${topic}"
+                  return
+                fi
+                /opt/kafka/bin/kafka-topics.sh \
+                  --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
+                  --command-config "${CLIENT_CFG}" \
+                  --create \
+                  --topic "${topic}" \
+                  --partitions 3 \
+                  --replication-factor 1
+              }
+
+              ensure_topic "${PLATFORM_DEPLOY_PREPARED_TOPIC}"
+              ensure_topic "${PLATFORM_DEPLOY_DLQ_TOPIC}"
+              echo "Platform deploy topics are ready."
