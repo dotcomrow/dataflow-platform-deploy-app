@@ -20,6 +20,9 @@ data:
     FLOW_NAME = os.environ.get("NIFI_FLOW_NAME", "platform-app-deploy")
     CERT_DIR = os.environ.get("NIFI_TLS_DIR", "/nifi-tls")
     KAFKA_CREDENTIALS_DIR = os.environ.get("KAFKA_CREDENTIALS_DIR", "/kafka-credentials")
+    KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092")
+    KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "SASL_PLAINTEXT")
+    KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "SCRAM-SHA-256")
     CLIENT_ID = str(uuid.uuid4())
 
     CONTEXT = ssl.create_default_context(cafile=os.path.join(CERT_DIR, "ca.crt"))
@@ -378,9 +381,9 @@ data:
       kafka_service = configure_controller_service(
         kafka_service,
         [
-          (["bootstrap.servers", "Bootstrap Servers"], "#{platform.kafka.bootstrap.servers}"),
-          (["security.protocol", "Security Protocol"], "#{platform.kafka.security.protocol}"),
-          (["sasl.mechanism", "SASL Mechanism"], "#{platform.kafka.sasl.mechanism}"),
+          (["bootstrap.servers", "Bootstrap Servers"], KAFKA_BOOTSTRAP_SERVERS),
+          (["security.protocol", "Security Protocol"], KAFKA_SECURITY_PROTOCOL),
+          (["sasl.mechanism", "SASL Mechanism"], KAFKA_SASL_MECHANISM),
           (["sasl.username", "SASL Username"], read_kafka_secret("nifi_username")),
           (["sasl.password", "SASL Password"], "#{nifi_password}"),
         ],
@@ -523,6 +526,21 @@ spec:
               value: "/nifi-tls"
             - name: KAFKA_CREDENTIALS_DIR
               value: "/kafka-credentials"
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_bootstrap_servers
+            - name: KAFKA_SECURITY_PROTOCOL
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_security_protocol
+            - name: KAFKA_SASL_MECHANISM
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: kafka_sasl_mechanism
           command: ["python", "/bootstrap/bootstrap_flow.py"]
           volumeMounts:
             - name: bootstrap-script
