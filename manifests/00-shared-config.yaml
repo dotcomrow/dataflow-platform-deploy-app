@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-deploy-flow-config
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+data:
+  kafka_bootstrap_servers: "kafka.kafka.svc.internal.lan:9092"
+  kafka_security_protocol: "SASL_PLAINTEXT"
+  kafka_sasl_mechanism: "SCRAM-SHA-256"
+  request_topic: "batch.platform.deploy.requests.v1"
+  dlq_topic: "batch.platform.deploy.requests.dlq.v1"
+  consumer_group: "nifi-platform-deploy-v1"
+  platform_deploy_service_url: "http://platform-deploy-service.directus.svc.cluster.local:8080"
+  flink_rest_url: "http://flink-rest.kafka.svc.cluster.local:8081"
+  flink_jar_id: "platform-deploy-flink-job.jar"
+  flink_entry_class: "com.suncoast.platform.deploy.flink.PlatformDeployJob"
+  flink_parallelism: "1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: platform-deploy-kafka-credentials
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+type: Opaque
+stringData:
+  admin_username: "<path:secret/data/kafka-admin-username#value>"
+  admin_password: "<path:secret/data/kafka-admin-password#value>"
+  nifi_username: "<path:secret/data/kafka-nifi-username#value>"
+  nifi_password: "<path:secret/data/kafka-nifi-password#value>"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: platform-deploy-flow-secrets
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "50"
+type: Opaque
+stringData:
+  platform_deploy_service_token: "<path:secret/data/platform-deploy-service#token>"

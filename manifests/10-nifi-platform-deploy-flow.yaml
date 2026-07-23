@@ -1,0 +1,292 @@
+apiVersion: nifi.konpyutaika.com/v2alpha1
+kind: NifiRegistryClient
+metadata:
+  name: platform-deploy-flow-registry
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "62"
+spec:
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  description: "Registry client for platform app deployment orchestration"
+  type: registry
+  registryClientConfig:
+    uri: "http://nifi-registry.dataflow.svc.cluster.local:18080"
+---
+apiVersion: nifi.konpyutaika.com/v1
+kind: NifiParameterContext
+metadata:
+  name: platform-deploy-context
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "63"
+spec:
+  description: "Parameters for platform app deployment orchestration"
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  secretRefs:
+    - name: platform-deploy-kafka-credentials
+      namespace: dataflow
+    - name: platform-deploy-flow-secrets
+      namespace: dataflow
+  parameters:
+    - name: platform.kafka.bootstrap.servers
+      value: kafka.kafka.svc.internal.lan:9092
+    - name: platform.kafka.security.protocol
+      value: SASL_PLAINTEXT
+    - name: platform.kafka.sasl.mechanism
+      value: SCRAM-SHA-256
+    - name: platform.deploy.request.topic
+      value: batch.platform.deploy.requests.v1
+    - name: platform.deploy.dlq.topic
+      value: batch.platform.deploy.requests.dlq.v1
+    - name: platform.deploy.consumer.group
+      value: nifi-platform-deploy-v1
+    - name: platform.deploy.service.url
+      value: http://platform-deploy-service.directus.svc.cluster.local:8080
+    - name: platform.deploy.flink.rest.url
+      value: http://flink-rest.kafka.svc.cluster.local:8081
+    - name: platform.deploy.flink.jar.id
+      value: platform-deploy-flink-job.jar
+    - name: platform.deploy.flink.entry.class
+      value: com.suncoast.platform.deploy.flink.PlatformDeployJob
+    - name: platform.deploy.flink.parallelism
+      value: "1"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-deploy-flow-spec
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "64"
+data:
+  flow.json: |
+    {
+      "name": "platform-app-deploy",
+      "processors": [
+        {
+          "name": "consume-platform-deploy-requests",
+          "type": "org.apache.nifi.kafka.processors.ConsumeKafka",
+          "relationships": ["success"]
+        },
+        {
+          "name": "extract-platform-deploy-metadata",
+          "type": "org.apache.nifi.processors.standard.EvaluateJsonPath",
+          "relationships": ["matched", "unmatched", "failure"]
+        },
+        {
+          "name": "set-platform-deploy-authorization",
+          "type": "org.apache.nifi.processors.attributes.UpdateAttribute",
+          "relationships": ["success"]
+        },
+        {
+          "name": "mark-platform-operation-running",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{platform.deploy.service.url}/internal/operations/${platform.operation_id}/start",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "build-platform-flink-run-request",
+          "type": "org.apache.nifi.processors.standard.ReplaceText",
+          "relationships": ["success", "failure"]
+        },
+        {
+          "name": "submit-platform-deploy-flink-job",
+          "type": "org.apache.nifi.processors.standard.InvokeHTTP",
+          "url": "#{platform.deploy.flink.rest.url}/jars/#{platform.deploy.flink.jar.id}/run",
+          "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
+        },
+        {
+          "name": "publish-platform-deploy-dlq",
+          "type": "org.apache.nifi.kafka.processors.PublishKafka",
+          "topic": "#{platform.deploy.dlq.topic}",
+          "relationships": ["success", "failure"]
+        }
+      ]
+    }
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: platform-deploy-nifi-registry-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "65"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform-deploy-nifi-registry-bootstrap
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap-registry-flow
+          image: curlimages/curl:8.12.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NIFI_REGISTRY_API
+              value: "http://nifi-registry.dataflow.svc.cluster.local:18080/nifi-registry-api"
+            - name: NIFI_REGISTRY_BUCKET_ID
+              value: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
+            - name: NIFI_REGISTRY_FLOW_ID
+              value: "46d4e1b6-e423-49c2-9b5f-636e9f12f171"
+            - name: NIFI_REGISTRY_FLOW_NAME
+              value: "platform-app-deploy"
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              set -euo pipefail
+
+              check_http() {
+                local method="$1"
+                local url="$2"
+                local body_file="${3:-}"
+                local status=""
+                if [ -n "${body_file}" ]; then
+                  status="$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X "${method}" \
+                    -H "Content-Type: application/json" "${url}" --data @"${body_file}" || true)"
+                else
+                  status="$(curl -sS -o /tmp/resp.json -w "%{http_code}" -X "${method}" "${url}" || true)"
+                fi
+                echo "${status}"
+              }
+
+              echo "Waiting for NiFi Registry API..."
+              ready="false"
+              for _ in $(seq 1 120); do
+                code="$(check_http GET "${NIFI_REGISTRY_API}/buckets")"
+                if [ "${code}" = "200" ]; then
+                  ready="true"
+                  break
+                fi
+                sleep 2
+              done
+              if [ "${ready}" != "true" ]; then
+                echo "NiFi Registry API is not ready."
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}")"
+              if [ "${code}" != "200" ]; then
+                echo "Registry bucket id not found: ${NIFI_REGISTRY_BUCKET_ID}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}")"
+              if [ "${code}" = "404" ]; then
+                cat > /tmp/flow.json <<EOF
+              {
+                "identifier": "${NIFI_REGISTRY_FLOW_ID}",
+                "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
+                "name": "${NIFI_REGISTRY_FLOW_NAME}",
+                "description": "Platform app deployment orchestration flow"
+              }
+              EOF
+                code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows" /tmp/flow.json)"
+                if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                  echo "Failed creating Registry flow: HTTP ${code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
+              elif [ "${code}" != "200" ]; then
+                echo "Unexpected response checking Registry flow: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}")"
+              if [ "${code}" != "200" ]; then
+                echo "Registry flow was not found after bootstrap: ${NIFI_REGISTRY_FLOW_ID}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
+              if [ "${code}" = "200" ]; then
+                echo "Flow version 1 already exists; nothing to do."
+                exit 0
+              fi
+              if [ "${code}" != "404" ]; then
+                echo "Unexpected response checking flow version 1: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              cat > /tmp/flow-v1.json <<EOF
+              {
+                "snapshotMetadata": {
+                  "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
+                  "flowIdentifier": "${NIFI_REGISTRY_FLOW_ID}",
+                  "version": 1
+                },
+                "flowContents": {
+                  "identifier": "root-group",
+                  "name": "${NIFI_REGISTRY_FLOW_NAME}",
+                  "comments": "Initial platform app deployment orchestration flow snapshot",
+                  "processGroups": [],
+                  "remoteProcessGroups": [],
+                  "processors": [],
+                  "inputPorts": [],
+                  "outputPorts": [],
+                  "connections": [],
+                  "labels": [],
+                  "funnels": []
+                }
+              }
+              EOF
+
+              code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /tmp/flow-v1.json)"
+              if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                echo "Failed creating flow version 1: HTTP ${code}"
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+
+              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
+              if [ "${code}" != "200" ]; then
+                echo "Flow version 1 was not found after bootstrap."
+                cat /tmp/resp.json || true
+                exit 1
+              fi
+---
+apiVersion: nifi.konpyutaika.com/v1
+kind: NifiDataflow
+metadata:
+  name: platform-app-deploy
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "66"
+spec:
+  displayName: "platform-app-deploy"
+  parentProcessGroupID: "root"
+  bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
+  flowId: "46d4e1b6-e423-49c2-9b5f-636e9f12f171"
+  flowVersion: 1
+  flowPosition:
+    posX: 800
+    posY: 0
+  syncMode: never
+  updateStrategy: drain
+  skipInvalidControllerService: true
+  skipInvalidComponent: true
+  clusterRef:
+    name: nifi-external
+    namespace: dataflow
+  registryClientRef:
+    name: platform-deploy-flow-registry
+    namespace: dataflow
+  parameterContextRef:
+    name: platform-deploy-context
+    namespace: dataflow

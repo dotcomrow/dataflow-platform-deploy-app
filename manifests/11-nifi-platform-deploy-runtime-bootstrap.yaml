@@ -1,0 +1,547 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-deploy-nifi-runtime-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "64"
+data:
+  bootstrap_flow.py: |
+    import json
+    import os
+    import re
+    import ssl
+    import time
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    NIFI_API = os.environ.get("NIFI_API", "https://nifi-0.nifi-hs.kafka.svc.cluster.local:8443/nifi-api").rstrip("/")
+    FLOW_NAME = os.environ.get("NIFI_FLOW_NAME", "platform-app-deploy")
+    CERT_DIR = os.environ.get("NIFI_TLS_DIR", "/nifi-tls")
+    KAFKA_CREDENTIALS_DIR = os.environ.get("KAFKA_CREDENTIALS_DIR", "/kafka-credentials")
+    CLIENT_ID = str(uuid.uuid4())
+
+    CONTEXT = ssl.create_default_context(cafile=os.path.join(CERT_DIR, "ca.crt"))
+    CONTEXT.load_cert_chain(
+      certfile=os.path.join(CERT_DIR, "tls.crt"),
+      keyfile=os.path.join(CERT_DIR, "tls.key"),
+    )
+
+    def api(method, path, payload=None, timeout=60):
+      data = None
+      headers = {"Accept": "application/json"}
+      if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+      request = urllib.request.Request(f"{NIFI_API}{path}", data=data, headers=headers, method=method)
+      try:
+        with urllib.request.urlopen(request, context=CONTEXT, timeout=timeout) as response:
+          body = response.read().decode("utf-8")
+          return json.loads(body) if body else {}
+      except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{method} {path} failed with HTTP {exc.code}: {body}") from exc
+
+    def revision(entity):
+      return {
+        "clientId": CLIENT_ID,
+        "version": entity["revision"]["version"],
+      }
+
+    def read_secret_file(directory, name):
+      with open(os.path.join(directory, name), "r", encoding="utf-8") as secret_file:
+        return secret_file.read().strip()
+
+    def read_kafka_secret(name):
+      return read_secret_file(KAFKA_CREDENTIALS_DIR, name)
+
+    def norm(value):
+      return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+    def descriptor_key(descriptors, candidates):
+      wanted = {norm(candidate) for candidate in candidates}
+      for key, descriptor in descriptors.items():
+        names = [key, descriptor.get("name"), descriptor.get("displayName")]
+        if any(norm(name) in wanted for name in names):
+          return key
+      available = ", ".join(sorted(descriptors.keys()))
+      raise RuntimeError(f"Could not find descriptor {candidates}; available: {available}")
+
+    def wait_for_cluster():
+      last_error = None
+      for _ in range(120):
+        try:
+          cluster = api("GET", "/controller/cluster", timeout=20).get("cluster", {})
+          nodes = cluster.get("nodes", [])
+          if nodes and all(node.get("status") == "CONNECTED" for node in nodes):
+            return
+        except Exception as exc:
+          last_error = exc
+        time.sleep(5)
+      raise RuntimeError(f"NiFi cluster was not ready: {last_error}")
+
+    def find_process_group():
+      root = api("GET", "/flow/process-groups/root", timeout=30).get("processGroupFlow", {})
+      for process_group in root.get("flow", {}).get("processGroups", []):
+        component = process_group.get("component", {})
+        if component.get("name") == FLOW_NAME:
+          return component["id"]
+      return ""
+
+    def ensure_process_group():
+      for _ in range(180):
+        process_group_id = find_process_group()
+        if process_group_id:
+          return process_group_id
+        created = api(
+          "POST",
+          "/process-groups/root/process-groups",
+          {
+            "revision": {"clientId": CLIENT_ID, "version": 0},
+            "component": {
+              "name": FLOW_NAME,
+              "position": {"x": 800, "y": 0},
+            },
+          },
+        )
+        component = created.get("component", {})
+        if component.get("id"):
+          return component["id"]
+        time.sleep(5)
+      raise RuntimeError(f"Process group {FLOW_NAME} could not be created under root.")
+
+    def list_processors(process_group_id):
+      return api("GET", f"/process-groups/{process_group_id}/processors").get("processors", [])
+
+    def list_connections(process_group_id):
+      return api("GET", f"/process-groups/{process_group_id}/connections").get("connections", [])
+
+    def list_controller_services(process_group_id):
+      return api("GET", f"/flow/process-groups/{process_group_id}/controller-services").get("controllerServices", [])
+
+    def find_by_name(entities, name):
+      for entity in entities:
+        if entity.get("component", {}).get("name") == name:
+          return entity
+      return None
+
+    def ensure_controller_service(process_group_id):
+      existing = find_by_name(list_controller_services(process_group_id), "platform-deploy-kafka-connection")
+      if existing:
+        return existing
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/controller-services",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": "platform-deploy-kafka-connection",
+            "type": "org.apache.nifi.kafka.service.Kafka3ConnectionService",
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": "nifi-kafka-3-service-nar",
+              "version": "2.7.1",
+            },
+          },
+        },
+      )
+
+    def ensure_processor(process_group_id, name, processor_type, artifact, x, y):
+      existing = find_by_name(list_processors(process_group_id), name)
+      if existing:
+        return existing
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/processors",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": name,
+            "type": processor_type,
+            "bundle": {
+              "group": "org.apache.nifi",
+              "artifact": artifact,
+              "version": "2.7.1",
+            },
+            "position": {"x": x, "y": y},
+          },
+        },
+      )
+
+    def configure_controller_service(entity, property_specs):
+      entity = api("GET", f"/controller-services/{entity['id']}")
+      component = entity["component"]
+      descriptors = component.get("descriptors", {})
+      properties = dict(component.get("properties") or {})
+      for candidates, value in property_specs:
+        properties[descriptor_key(descriptors, candidates)] = value
+      return api(
+        "PUT",
+        f"/controller-services/{entity['id']}",
+        {
+          "revision": revision(entity),
+          "component": {
+            "id": entity["id"],
+            "properties": properties,
+          },
+        },
+      )
+
+    def configure_processor(entity, property_specs, auto_terminated=None, dynamic_property_specs=None):
+      entity = api("GET", f"/processors/{entity['id']}")
+      config = entity["component"].get("config", {})
+      descriptors = config.get("descriptors", {})
+      properties = dict(config.get("properties") or {})
+      for candidates, value in property_specs:
+        properties[descriptor_key(descriptors, candidates)] = value
+      for name, value in dynamic_property_specs or []:
+        properties[name] = value
+      new_config = {"properties": properties}
+      if auto_terminated is not None:
+        new_config["autoTerminatedRelationships"] = auto_terminated
+      return api(
+        "PUT",
+        f"/processors/{entity['id']}",
+        {
+          "revision": revision(entity),
+          "component": {
+            "id": entity["id"],
+            "config": new_config,
+          },
+        },
+      )
+
+    def set_processor_state(entity, state):
+      entity = api("GET", f"/processors/{entity['id']}")
+      if entity["component"].get("state") == state:
+        return entity
+      api(
+        "PUT",
+        f"/processors/{entity['id']}/run-status",
+        {
+          "revision": revision(entity),
+          "state": state,
+          "disconnectedNodeAcknowledged": False,
+        },
+      )
+      for _ in range(60):
+        current = api("GET", f"/processors/{entity['id']}")
+        if current["component"].get("state") == state:
+          return current
+        time.sleep(1)
+      raise RuntimeError(f"Processor {entity['component']['name']} did not reach {state}.")
+
+    def set_controller_service_state(entity, state):
+      entity = api("GET", f"/controller-services/{entity['id']}")
+      if entity["component"].get("state") == state:
+        return entity
+      api(
+        "PUT",
+        f"/controller-services/{entity['id']}/run-status",
+        {
+          "revision": revision(entity),
+          "state": state,
+          "disconnectedNodeAcknowledged": False,
+        },
+      )
+      for _ in range(60):
+        current = api("GET", f"/controller-services/{entity['id']}")
+        if current["component"].get("state") == state:
+          return current
+        time.sleep(1)
+      raise RuntimeError(f"Controller service {entity['component']['name']} did not reach {state}.")
+
+    def ensure_connection(process_group_id, name, source_id, destination_id, relationships):
+      for connection in list_connections(process_group_id):
+        component = connection.get("component", {})
+        if component.get("name") == name:
+          current_source = component.get("source", {})
+          current_destination = component.get("destination", {})
+          current_relationships = sorted(component.get("selectedRelationships") or [])
+          if (
+            current_source.get("id") != source_id
+            or current_destination.get("id") != destination_id
+            or current_relationships != sorted(relationships)
+          ):
+            api(
+              "DELETE",
+              f"/connections/{connection['id']}?version={connection['revision']['version']}&clientId={CLIENT_ID}",
+            )
+            break
+          return connection
+      else:
+        connection = None
+      if connection and connection.get("component", {}).get("name") == name:
+        return connection
+      return api(
+        "POST",
+        f"/process-groups/{process_group_id}/connections",
+        {
+          "revision": {"clientId": CLIENT_ID, "version": 0},
+          "component": {
+            "name": name,
+            "source": {
+              "id": source_id,
+              "groupId": process_group_id,
+              "type": "PROCESSOR",
+            },
+            "destination": {
+              "id": destination_id,
+              "groupId": process_group_id,
+              "type": "PROCESSOR",
+            },
+            "selectedRelationships": relationships,
+            "flowFileExpiration": "0 sec",
+            "backPressureObjectThreshold": 10000,
+            "backPressureDataSizeThreshold": "1 GB",
+          },
+        },
+      )
+
+    def main():
+      wait_for_cluster()
+      process_group_id = ensure_process_group()
+
+      kafka_service = ensure_controller_service(process_group_id)
+      consume = ensure_processor(
+        process_group_id,
+        "consume-platform-deploy-requests",
+        "org.apache.nifi.kafka.processors.ConsumeKafka",
+        "nifi-kafka-nar",
+        0,
+        0,
+      )
+      extract_metadata = ensure_processor(
+        process_group_id,
+        "extract-platform-deploy-metadata",
+        "org.apache.nifi.processors.standard.EvaluateJsonPath",
+        "nifi-standard-nar",
+        300,
+        0,
+      )
+      set_auth = ensure_processor(
+        process_group_id,
+        "set-platform-deploy-authorization",
+        "org.apache.nifi.processors.attributes.UpdateAttribute",
+        "nifi-update-attribute-nar",
+        600,
+        0,
+      )
+      mark_running = ensure_processor(
+        process_group_id,
+        "mark-platform-operation-running",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        900,
+        0,
+      )
+      build_flink_request = ensure_processor(
+        process_group_id,
+        "build-platform-flink-run-request",
+        "org.apache.nifi.processors.standard.ReplaceText",
+        "nifi-standard-nar",
+        1200,
+        0,
+      )
+      submit_flink = ensure_processor(
+        process_group_id,
+        "submit-platform-deploy-flink-job",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        1500,
+        0,
+      )
+      dlq = ensure_processor(
+        process_group_id,
+        "publish-platform-deploy-dlq",
+        "org.apache.nifi.kafka.processors.PublishKafka",
+        "nifi-kafka-nar",
+        900,
+        280,
+      )
+
+      processors = (
+        consume,
+        extract_metadata,
+        set_auth,
+        mark_running,
+        build_flink_request,
+        submit_flink,
+        dlq,
+      )
+
+      for processor in processors:
+        set_processor_state(processor, "STOPPED")
+      set_controller_service_state(kafka_service, "DISABLED")
+
+      kafka_service = configure_controller_service(
+        kafka_service,
+        [
+          (["bootstrap.servers", "Bootstrap Servers"], "#{platform.kafka.bootstrap.servers}"),
+          (["security.protocol", "Security Protocol"], "#{platform.kafka.security.protocol}"),
+          (["sasl.mechanism", "SASL Mechanism"], "#{platform.kafka.sasl.mechanism}"),
+          (["sasl.username", "SASL Username"], read_kafka_secret("nifi_username")),
+          (["sasl.password", "SASL Password"], "#{nifi_password}"),
+        ],
+      )
+      kafka_service = set_controller_service_state(kafka_service, "ENABLED")
+
+      consume = configure_processor(
+        consume,
+        [
+          (["Kafka Connection Service"], kafka_service["id"]),
+          (["Group ID"], "#{platform.deploy.consumer.group}"),
+          (["Topics"], "#{platform.deploy.request.topic}"),
+          (["auto.offset.reset", "Auto Offset Reset"], "earliest"),
+        ],
+      )
+      extract_metadata = configure_processor(
+        extract_metadata,
+        [
+          (["Destination"], "flowfile-attribute"),
+          (["Return Type"], "auto-detect"),
+          (["Path Not Found Behavior"], "ignore"),
+          (["Null Value Representation"], "empty string"),
+        ],
+        None,
+        [
+          ("platform.operation_id", "$.operation_id"),
+          ("platform.app_id", "$.app_id"),
+          ("platform.operation_type", "$.operation_type"),
+          ("platform.sequence", "$.sequence"),
+          ("platform.deployment_strategy", "$.deployment_strategy"),
+        ],
+      )
+      set_auth = configure_processor(
+        set_auth,
+        [],
+        None,
+        [("Authorization", "Bearer #{platform_deploy_service_token}")],
+      )
+      mark_running = configure_processor(
+        mark_running,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], "#{platform.deploy.service.url}/internal/operations/${platform.operation_id}/start"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "60 sec"),
+        ],
+        ["Response"],
+      )
+      build_flink_request = configure_processor(
+        build_flink_request,
+        [
+          (["Replacement Strategy"], "Always Replace"),
+          (
+            ["Replacement Value"],
+            "{\"entryClass\":\"#{platform.deploy.flink.entry.class}\",\"parallelism\":#{platform.deploy.flink.parallelism},\"programArgs\":\"--operation-id ${platform.operation_id:escapeJson()} --app-id ${platform.app_id:escapeJson()} --operation-type ${platform.operation_type:escapeJson()} --platform-deploy-service-url #{platform.deploy.service.url} --source nifi\"}",
+          ),
+          (["Evaluation Mode"], "Entire text"),
+        ],
+      )
+      submit_flink = configure_processor(
+        submit_flink,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], "#{platform.deploy.flink.rest.url}/jars/#{platform.deploy.flink.jar.id}/run"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "120 sec"),
+        ],
+        ["Original", "Response"],
+      )
+      dlq = configure_processor(
+        dlq,
+        [
+          (["Kafka Connection Service"], kafka_service["id"]),
+          (["Topic Name", "Topic"], "#{platform.deploy.dlq.topic}"),
+        ],
+        ["success", "failure"],
+      )
+
+      ensure_connection(process_group_id, "consume-to-extract-platform-deploy-metadata", consume["id"], extract_metadata["id"], ["success"])
+      ensure_connection(process_group_id, "metadata-to-set-platform-deploy-auth", extract_metadata["id"], set_auth["id"], ["matched"])
+      ensure_connection(process_group_id, "metadata-failures-to-platform-deploy-dlq", extract_metadata["id"], dlq["id"], ["failure", "unmatched"])
+      ensure_connection(process_group_id, "auth-to-mark-platform-operation-running", set_auth["id"], mark_running["id"], ["success"])
+      ensure_connection(process_group_id, "running-original-to-build-flink-run-request", mark_running["id"], build_flink_request["id"], ["Original"])
+      ensure_connection(process_group_id, "running-failures-to-platform-deploy-dlq", mark_running["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+      ensure_connection(process_group_id, "flink-request-to-submit-platform-deploy-job", build_flink_request["id"], submit_flink["id"], ["success"])
+      ensure_connection(process_group_id, "flink-request-failures-to-platform-deploy-dlq", build_flink_request["id"], dlq["id"], ["failure"])
+      ensure_connection(process_group_id, "flink-submit-failures-to-platform-deploy-dlq", submit_flink["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+
+      for processor in (
+        dlq,
+        submit_flink,
+        build_flink_request,
+        mark_running,
+        set_auth,
+        extract_metadata,
+        consume,
+      ):
+        set_processor_state(processor, "RUNNING")
+      print(f"Platform deploy NiFi flow is configured and running in process group {process_group_id}.")
+
+    if __name__ == "__main__":
+      main()
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: platform-deploy-nifi-runtime-bootstrap
+  namespace: dataflow
+  annotations:
+    argocd.argoproj.io/sync-wave: "67"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+    argocd.argoproj.io/sync-options: Replace=true
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: platform-deploy-nifi-runtime-bootstrap
+      annotations:
+        linkerd.io/inject: "disabled"
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: bootstrap-runtime-flow
+          image: python:3.11-slim
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NIFI_API
+              value: "https://nifi-0.nifi-hs.kafka.svc.cluster.local:8443/nifi-api"
+            - name: NIFI_FLOW_NAME
+              value: "platform-app-deploy"
+            - name: NIFI_TLS_DIR
+              value: "/nifi-tls"
+            - name: KAFKA_CREDENTIALS_DIR
+              value: "/kafka-credentials"
+          command: ["python", "/bootstrap/bootstrap_flow.py"]
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /bootstrap
+              readOnly: true
+            - name: nifi-tls
+              mountPath: /nifi-tls
+              readOnly: true
+            - name: kafka-credentials
+              mountPath: /kafka-credentials
+              readOnly: true
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: platform-deploy-nifi-runtime-bootstrap
+            defaultMode: 0555
+        - name: nifi-tls
+          secret:
+            secretName: nifi-external-cluster-tls-auth
+        - name: kafka-credentials
+          secret:
+            secretName: platform-deploy-kafka-credentials
