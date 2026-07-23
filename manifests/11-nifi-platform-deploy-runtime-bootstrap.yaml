@@ -154,6 +154,8 @@ data:
           last_error = exc
           if "HTTP 409" not in str(exc):
             raise
+          for processor in list_processors(process_group_id):
+            set_processor_state(processor, "STOPPED")
           time.sleep(1)
       if last_error:
         raise last_error
@@ -298,10 +300,12 @@ data:
       transition_state = {"RUNNING": "STARTING", "STOPPED": "STOPPING"}.get(state)
       for _ in range(120):
         entity = api("GET", f"/processors/{entity['id']}")
-        current_state = entity["component"].get("state")
-        if current_state == state:
+        component = entity["component"]
+        current_state = component.get("state")
+        physical_state = component.get("physicalState") or current_state
+        if current_state == state and physical_state == state:
           return entity
-        if current_state == transition_state:
+        if physical_state == transition_state:
           time.sleep(1)
           continue
         try:
