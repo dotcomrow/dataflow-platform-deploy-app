@@ -427,6 +427,8 @@ data:
       )
 
     def remove_stale_flink_submit_path(process_group_id):
+      for processor in list_processors(process_group_id):
+        set_processor_state(processor, "STOPPED")
       for connection_name in (
         "running-original-to-build-flink-run-request",
         "flink-request-to-submit-platform-deploy-job",
