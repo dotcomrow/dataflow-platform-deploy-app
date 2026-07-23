@@ -202,28 +202,51 @@ data:
       return True
 
     def configure_processor(entity, property_specs, auto_terminated=None, dynamic_property_specs=None):
-      entity = api("GET", f"/processors/{entity['id']}")
-      config = entity["component"].get("config", {})
-      descriptors = config.get("descriptors", {})
-      properties = dict(config.get("properties") or {})
-      for candidates, value in property_specs:
-        properties[descriptor_key(descriptors, candidates)] = value
-      for name, value in dynamic_property_specs or []:
-        properties[name] = value
-      new_config = {"properties": properties}
-      if auto_terminated is not None:
-        new_config["autoTerminatedRelationships"] = auto_terminated
-      return api(
-        "PUT",
-        f"/processors/{entity['id']}",
-        {
-          "revision": revision(entity),
-          "component": {
-            "id": entity["id"],
-            "config": new_config,
-          },
-        },
-      )
+      last_error = None
+      for _ in range(60):
+        entity = api("GET", f"/processors/{entity['id']}")
+        config = entity["component"].get("config", {})
+        descriptors = config.get("descriptors", {})
+        properties = dict(config.get("properties") or {})
+        desired_properties = dict(properties)
+        for candidates, value in property_specs:
+          desired_properties[descriptor_key(descriptors, candidates)] = value
+        for name, value in dynamic_property_specs or []:
+          desired_properties[name] = value
+
+        properties_match = all(properties.get(key) == value for key, value in desired_properties.items())
+        relationships_match = True
+        if auto_terminated is not None:
+          relationships_match = sorted(config.get("autoTerminatedRelationships") or []) == sorted(auto_terminated)
+        if properties_match and relationships_match:
+          return entity
+
+        if entity["component"].get("state") == "RUNNING":
+          set_processor_state(entity, "STOPPED")
+          time.sleep(1)
+          continue
+
+        new_config = {"properties": desired_properties}
+        if auto_terminated is not None:
+          new_config["autoTerminatedRelationships"] = auto_terminated
+        try:
+          return api(
+            "PUT",
+            f"/processors/{entity['id']}",
+            {
+              "revision": revision(entity),
+              "component": {
+                "id": entity["id"],
+                "config": new_config,
+              },
+            },
+          )
+        except RuntimeError as exc:
+          last_error = exc
+          if "HTTP 409" not in str(exc):
+            raise
+          time.sleep(1)
+      raise last_error
 
     def set_processor_state(entity, state):
       entity = api("GET", f"/processors/{entity['id']}")
