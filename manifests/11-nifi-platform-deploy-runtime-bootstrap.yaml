@@ -23,6 +23,7 @@ data:
     KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka.kafka.svc.internal.lan:9092")
     KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "SASL_PLAINTEXT")
     KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "SCRAM-SHA-256")
+    FLOW_SECRETS_DIR = os.environ.get("FLOW_SECRETS_DIR", "/flow-secrets")
     PARAMETER_CONTEXT_NAME = os.environ.get("NIFI_PARAMETER_CONTEXT_NAME", "platform-deploy-context")
     CLIENT_ID = str(uuid.uuid4())
 
@@ -59,6 +60,9 @@ data:
 
     def read_kafka_secret(name):
       return read_secret_file(KAFKA_CREDENTIALS_DIR, name)
+
+    def read_flow_secret(name):
+      return read_secret_file(FLOW_SECRETS_DIR, name)
 
     def norm(value):
       return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
@@ -124,6 +128,7 @@ data:
 
     def ensure_process_group_parameter_context(process_group_id):
       parameter_context = find_parameter_context()
+      last_error = None
       for _ in range(60):
         process_group = api("GET", f"/process-groups/{process_group_id}")
         component = process_group["component"]
@@ -146,9 +151,12 @@ data:
           )
           return
         except RuntimeError as exc:
+          last_error = exc
           if "HTTP 409" not in str(exc):
             raise
           time.sleep(1)
+      if last_error:
+        raise last_error
       raise RuntimeError(f"Process group {FLOW_NAME} could not be assigned parameter context {PARAMETER_CONTEXT_NAME}.")
 
     def list_processors(process_group_id):
@@ -470,6 +478,12 @@ data:
 
       for processor in processors:
         set_processor_state(processor, "STOPPED")
+      set_auth = configure_processor(
+        set_auth,
+        [],
+        None,
+        [("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}")],
+      )
       ensure_process_group_parameter_context(process_group_id)
 
       kafka_service_match_properties = [
@@ -520,7 +534,7 @@ data:
         set_auth,
         [],
         None,
-        [("Authorization", "Bearer #{platform_deploy_service_token}")],
+        [("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}")],
       )
       mark_running = configure_processor(
         mark_running,
@@ -626,6 +640,8 @@ spec:
               value: "/nifi-tls"
             - name: KAFKA_CREDENTIALS_DIR
               value: "/kafka-credentials"
+            - name: FLOW_SECRETS_DIR
+              value: "/flow-secrets"
             - name: NIFI_PARAMETER_CONTEXT_NAME
               value: "platform-deploy-context"
             - name: KAFKA_BOOTSTRAP_SERVERS
@@ -654,6 +670,9 @@ spec:
             - name: kafka-credentials
               mountPath: /kafka-credentials
               readOnly: true
+            - name: flow-secrets
+              mountPath: /flow-secrets
+              readOnly: true
       volumes:
         - name: bootstrap-script
           configMap:
@@ -665,3 +684,6 @@ spec:
         - name: kafka-credentials
           secret:
             secretName: platform-deploy-kafka-credentials
+        - name: flow-secrets
+          secret:
+            secretName: platform-deploy-flow-secrets
