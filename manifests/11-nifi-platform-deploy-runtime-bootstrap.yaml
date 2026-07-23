@@ -24,6 +24,10 @@ data:
     KAFKA_SECURITY_PROTOCOL = os.environ.get("KAFKA_SECURITY_PROTOCOL", "SASL_PLAINTEXT")
     KAFKA_SASL_MECHANISM = os.environ.get("KAFKA_SASL_MECHANISM", "SCRAM-SHA-256")
     FLOW_SECRETS_DIR = os.environ.get("FLOW_SECRETS_DIR", "/flow-secrets")
+    PLATFORM_DEPLOY_PREPARED_TOPIC = os.environ.get("PLATFORM_DEPLOY_PREPARED_TOPIC", "batch.platform.deploy.prepared.v1")
+    PLATFORM_DEPLOY_DLQ_TOPIC = os.environ.get("PLATFORM_DEPLOY_DLQ_TOPIC", "batch.platform.deploy.prepared.dlq.v1")
+    PLATFORM_DEPLOY_CONSUMER_GROUP = os.environ.get("PLATFORM_DEPLOY_CONSUMER_GROUP", "nifi-platform-deploy-prepared-v1")
+    PLATFORM_DEPLOY_SERVICE_URL = os.environ.get("PLATFORM_DEPLOY_SERVICE_URL", "http://platform-deploy-service.directus.svc.cluster.local:8080").rstrip("/")
     PARAMETER_CONTEXT_NAME = os.environ.get("NIFI_PARAMETER_CONTEXT_NAME", "platform-deploy-context")
     CLIENT_ID = str(uuid.uuid4())
 
@@ -530,8 +534,8 @@ data:
         consume,
         [
           (["Kafka Connection Service"], kafka_service["id"]),
-          (["Group ID"], "#{platform.deploy.consumer.group}"),
-          (["Topics"], "#{platform.deploy.prepared.topic}"),
+          (["Group ID"], PLATFORM_DEPLOY_CONSUMER_GROUP),
+          (["Topics"], PLATFORM_DEPLOY_PREPARED_TOPIC),
           (["auto.offset.reset", "Auto Offset Reset"], "earliest"),
         ],
       )
@@ -564,7 +568,7 @@ data:
         mark_running,
         [
           (["HTTP Method"], "POST"),
-          (["HTTP URL", "Remote URL"], "#{platform.deploy.service.url}/internal/operations/${platform.operation_id}/start"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_SERVICE_URL}/internal/operations/${{platform.operation_id}}/start"),
           (["Request Body Enabled", "Send Message Body"], "true"),
           (["Request Content-Type", "Content-Type"], "application/json"),
           (["Request Header Attributes Pattern"], "Authorization"),
@@ -577,7 +581,7 @@ data:
         dlq,
         [
           (["Kafka Connection Service"], kafka_service["id"]),
-          (["Topic Name", "Topic"], "#{platform.deploy.dlq.topic}"),
+          (["Topic Name", "Topic"], PLATFORM_DEPLOY_DLQ_TOPIC),
         ],
         ["success", "failure"],
       )
@@ -654,6 +658,26 @@ spec:
                 configMapKeyRef:
                   name: platform-deploy-flow-config
                   key: kafka_sasl_mechanism
+            - name: PLATFORM_DEPLOY_PREPARED_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: prepared_topic
+            - name: PLATFORM_DEPLOY_DLQ_TOPIC
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: dlq_topic
+            - name: PLATFORM_DEPLOY_CONSUMER_GROUP
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: consumer_group
+            - name: PLATFORM_DEPLOY_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: platform_deploy_service_url
           command: ["python", "/bootstrap/bootstrap_flow.py"]
           volumeMounts:
             - name: bootstrap-script
