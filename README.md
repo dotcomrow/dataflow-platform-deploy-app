@@ -54,6 +54,5 @@ for the executor contract:
 
 Those endpoints are not implemented in this repository. The placeholder service
 URL is configured by `platform_deploy_executor_url` in
-`platform-deploy-flow-config`. Execution is disabled by default through
-`execution_enabled: "false"` so the flow can be deployed before the executor
-service exists.
+`platform-deploy-flow-config`. Execution is enabled through
+`execution_enabled: "true"` now that the executor service is deployed.
