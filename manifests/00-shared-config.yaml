@@ -13,6 +13,8 @@ data:
   dlq_topic: "batch.platform.deploy.prepared.dlq.v1"
   consumer_group: "nifi-platform-deploy-prepared-v1"
   platform_deploy_service_url: "http://platform-deploy-service.directus.svc.cluster.local:8080"
+  platform_deploy_executor_url: "http://platform-deploy-executor.directus.svc.cluster.local:8080"
+  execution_enabled: "false"
 ---
 apiVersion: v1
 kind: Secret

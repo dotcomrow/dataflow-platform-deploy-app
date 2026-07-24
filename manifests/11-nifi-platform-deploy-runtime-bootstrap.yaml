@@ -28,6 +28,8 @@ data:
     PLATFORM_DEPLOY_DLQ_TOPIC = os.environ.get("PLATFORM_DEPLOY_DLQ_TOPIC", "batch.platform.deploy.prepared.dlq.v1")
     PLATFORM_DEPLOY_CONSUMER_GROUP = os.environ.get("PLATFORM_DEPLOY_CONSUMER_GROUP", "nifi-platform-deploy-prepared-v1")
     PLATFORM_DEPLOY_SERVICE_URL = os.environ.get("PLATFORM_DEPLOY_SERVICE_URL", "http://platform-deploy-service.directus.svc.cluster.local:8080").rstrip("/")
+    PLATFORM_DEPLOY_EXECUTOR_URL = os.environ.get("PLATFORM_DEPLOY_EXECUTOR_URL", "http://platform-deploy-executor.directus.svc.cluster.local:8080").rstrip("/")
+    PLATFORM_DEPLOY_EXECUTION_ENABLED = os.environ.get("PLATFORM_DEPLOY_EXECUTION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
     PARAMETER_CONTEXT_NAME = os.environ.get("NIFI_PARAMETER_CONTEXT_NAME", "platform-deploy-context")
     CLIENT_ID = str(uuid.uuid4())
 
@@ -438,6 +440,9 @@ data:
         "flink-request-to-submit-platform-deploy-job",
         "flink-request-failures-to-platform-deploy-dlq",
         "flink-submit-failures-to-platform-deploy-dlq",
+        "running-failures-to-platform-deploy-dlq",
+        "running-original-to-route-platform-operation",
+        "prod-destroy-to-success-callback",
       ):
         delete_connection_by_name(process_group_id, connection_name)
       for processor_name in (
@@ -484,13 +489,93 @@ data:
         900,
         0,
       )
+      route_operation_type = ensure_processor(
+        process_group_id,
+        "route-platform-operation-type",
+        "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "nifi-standard-nar",
+        1200,
+        0,
+      )
+      prod_deploy = ensure_processor(
+        process_group_id,
+        "invoke-platform-prod-deploy",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        1500,
+        -180,
+      )
+      preview_deploy = ensure_processor(
+        process_group_id,
+        "invoke-platform-preview-deploy",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        1800,
+        -180,
+      )
+      preview_destroy = ensure_processor(
+        process_group_id,
+        "invoke-platform-preview-destroy",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        1500,
+        180,
+      )
+      prod_destroy = ensure_processor(
+        process_group_id,
+        "invoke-platform-prod-destroy",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        1800,
+        180,
+      )
+      route_after_destroy = ensure_processor(
+        process_group_id,
+        "route-platform-after-destroy",
+        "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "nifi-standard-nar",
+        2100,
+        180,
+      )
+      build_success_callback = ensure_processor(
+        process_group_id,
+        "build-platform-deploy-success-callback",
+        "org.apache.nifi.processors.standard.ReplaceText",
+        "nifi-standard-nar",
+        2400,
+        0,
+      )
+      finish_succeeded = ensure_processor(
+        process_group_id,
+        "finish-platform-operation-succeeded",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        2700,
+        0,
+      )
+      build_failure_callback = ensure_processor(
+        process_group_id,
+        "build-platform-deploy-failure-callback",
+        "org.apache.nifi.processors.standard.ReplaceText",
+        "nifi-standard-nar",
+        1800,
+        460,
+      )
+      finish_failed = ensure_processor(
+        process_group_id,
+        "finish-platform-operation-failed",
+        "org.apache.nifi.processors.standard.InvokeHTTP",
+        "nifi-standard-nar",
+        2100,
+        460,
+      )
       dlq = ensure_processor(
         process_group_id,
         "publish-platform-deploy-dlq",
         "org.apache.nifi.kafka.processors.PublishKafka",
         "nifi-kafka-nar",
-        900,
-        280,
+        2400,
+        460,
       )
 
       processors = (
@@ -498,6 +583,16 @@ data:
         extract_metadata,
         set_auth,
         mark_running,
+        route_operation_type,
+        prod_deploy,
+        preview_deploy,
+        preview_destroy,
+        prod_destroy,
+        route_after_destroy,
+        build_success_callback,
+        finish_succeeded,
+        build_failure_callback,
+        finish_failed,
         dlq,
       )
 
@@ -507,7 +602,10 @@ data:
         set_auth,
         [],
         None,
-        [("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}")],
+        [
+          ("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}"),
+          ("platform.execution_enabled", "true" if PLATFORM_DEPLOY_EXECUTION_ENABLED else "false"),
+        ],
       )
       set_controller_service_state(kafka_service, "DISABLED")
       ensure_process_group_parameter_context(process_group_id)
@@ -551,8 +649,11 @@ data:
         [
           ("platform.operation_id", "$.operation_id"),
           ("platform.app_id", "$.app_id"),
+          ("platform.app_key", "$.app_key"),
           ("platform.operation_type", "$.operation_type"),
           ("platform.sequence", "$.sequence"),
+          ("platform.site_key", "$.site_key"),
+          ("platform.keycloak_realm", "$.keycloak_realm"),
           ("platform.deployment_strategy", "$.deployment_strategy"),
           ("platform.prepared_at", "$.prepared_at"),
           ("platform.prepared_by", "$.prepared_by"),
@@ -562,7 +663,10 @@ data:
         set_auth,
         [],
         None,
-        [("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}")],
+        [
+          ("Authorization", f"Bearer {read_flow_secret('platform_deploy_service_token')}"),
+          ("platform.execution_enabled", "true" if PLATFORM_DEPLOY_EXECUTION_ENABLED else "false"),
+        ],
       )
       mark_running = configure_processor(
         mark_running,
@@ -575,7 +679,128 @@ data:
           (["Response Generation Required", "Always Output Response"], "true"),
           (["Socket Read Timeout"], "60 sec"),
         ],
+        ["Response"] if PLATFORM_DEPLOY_EXECUTION_ENABLED else ["Original", "Response"],
+      )
+      route_operation_type = configure_processor(
+        route_operation_type,
+        [
+          (["Routing Strategy"], "Route to Property name"),
+        ],
+        None,
+        [
+          ("destroy", "${platform.sequence:equals('destroy')}"),
+          ("recreate", "${platform.sequence:equals('recreate')}"),
+        ],
+      )
+      prod_deploy = configure_processor(
+        prod_deploy,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_EXECUTOR_URL}/internal/operations/${{platform.operation_id}}/steps/prod-deploy"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "1800 sec"),
+        ],
+        ["Response"],
+      )
+      preview_deploy = configure_processor(
+        preview_deploy,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_EXECUTOR_URL}/internal/operations/${{platform.operation_id}}/steps/preview-deploy"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "1800 sec"),
+        ],
+        ["Response"],
+      )
+      preview_destroy = configure_processor(
+        preview_destroy,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_EXECUTOR_URL}/internal/operations/${{platform.operation_id}}/steps/preview-destroy"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "1800 sec"),
+        ],
+        ["Response"],
+      )
+      prod_destroy = configure_processor(
+        prod_destroy,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_EXECUTOR_URL}/internal/operations/${{platform.operation_id}}/steps/prod-destroy"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "1800 sec"),
+        ],
+        ["Response"],
+      )
+      route_after_destroy = configure_processor(
+        route_after_destroy,
+        [
+          (["Routing Strategy"], "Route to Property name"),
+        ],
+        None,
+        [("destroy_complete", "${platform.sequence:equals('destroy')}")],
+      )
+      build_success_callback = configure_processor(
+        build_success_callback,
+        [
+          (["Replacement Strategy"], "Always Replace"),
+          (
+            ["Replacement Value"],
+            "{\"status\":\"succeeded\",\"app_id\":\"${platform.app_id:escapeJson()}\",\"result_json\":{\"completed_by\":\"nifi-platform-deploy-flow\",\"operation_type\":\"${platform.operation_type:escapeJson()}\",\"sequence\":\"${platform.sequence:escapeJson()}\"}}",
+          ),
+          (["Evaluation Mode"], "Entire text"),
+        ],
+        None,
+      )
+      finish_succeeded = configure_processor(
+        finish_succeeded,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_SERVICE_URL}/internal/operations/${{platform.operation_id}}/finish"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "60 sec"),
+        ],
         ["Original", "Response"],
+      )
+      build_failure_callback = configure_processor(
+        build_failure_callback,
+        [
+          (["Replacement Strategy"], "Always Replace"),
+          (
+            ["Replacement Value"],
+            "{\"status\":\"failed\",\"app_id\":\"${platform.app_id:escapeJson()}\",\"error_message\":\"Platform deploy orchestration failed in NiFi before completion or execution is disabled.\",\"log_excerpt\":\"See NiFi bulletin and platform deploy DLQ for the failed flowfile.\",\"result_json\":{\"failed_by\":\"nifi-platform-deploy-flow\",\"operation_type\":\"${platform.operation_type:escapeJson()}\",\"sequence\":\"${platform.sequence:escapeJson()}\",\"execution_enabled\":\"${platform.execution_enabled:escapeJson()}\"}}",
+          ),
+          (["Evaluation Mode"], "Entire text"),
+        ],
+        None,
+      )
+      finish_failed = configure_processor(
+        finish_failed,
+        [
+          (["HTTP Method"], "POST"),
+          (["HTTP URL", "Remote URL"], f"{PLATFORM_DEPLOY_SERVICE_URL}/internal/operations/${{platform.operation_id}}/finish"),
+          (["Request Body Enabled", "Send Message Body"], "true"),
+          (["Request Content-Type", "Content-Type"], "application/json"),
+          (["Request Header Attributes Pattern"], "Authorization"),
+          (["Response Generation Required", "Always Output Response"], "true"),
+          (["Socket Read Timeout"], "60 sec"),
+        ],
+        ["Response"],
       )
       dlq = configure_processor(
         dlq,
@@ -592,15 +817,59 @@ data:
       ensure_connection(process_group_id, "auth-to-mark-platform-operation-running", set_auth["id"], mark_running["id"], ["success"])
       ensure_connection(process_group_id, "running-failures-to-platform-deploy-dlq", mark_running["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
 
-      for processor in (
+      if PLATFORM_DEPLOY_EXECUTION_ENABLED:
+        ensure_connection(process_group_id, "running-original-to-route-platform-operation", mark_running["id"], route_operation_type["id"], ["Original"])
+        ensure_connection(process_group_id, "deploy-route-to-prod-deploy", route_operation_type["id"], prod_deploy["id"], ["unmatched"])
+        ensure_connection(process_group_id, "recreate-route-to-preview-destroy", route_operation_type["id"], preview_destroy["id"], ["recreate"])
+        ensure_connection(process_group_id, "destroy-route-to-preview-destroy", route_operation_type["id"], preview_destroy["id"], ["destroy"])
+        ensure_connection(process_group_id, "prod-deploy-to-preview-deploy", prod_deploy["id"], preview_deploy["id"], ["Original"])
+        ensure_connection(process_group_id, "preview-deploy-to-success-callback", preview_deploy["id"], build_success_callback["id"], ["Original"])
+        ensure_connection(process_group_id, "preview-destroy-to-prod-destroy", preview_destroy["id"], prod_destroy["id"], ["Original"])
+        ensure_connection(process_group_id, "prod-destroy-to-route-after-destroy", prod_destroy["id"], route_after_destroy["id"], ["Original"])
+        ensure_connection(process_group_id, "destroy-complete-to-success-callback", route_after_destroy["id"], build_success_callback["id"], ["destroy_complete"])
+        ensure_connection(process_group_id, "recreate-after-destroy-to-prod-deploy", route_after_destroy["id"], prod_deploy["id"], ["unmatched"])
+        ensure_connection(process_group_id, "prod-deploy-failures-to-failure-callback", prod_deploy["id"], build_failure_callback["id"], ["Failure", "No Retry", "Retry"])
+        ensure_connection(process_group_id, "preview-deploy-failures-to-failure-callback", preview_deploy["id"], build_failure_callback["id"], ["Failure", "No Retry", "Retry"])
+        ensure_connection(process_group_id, "preview-destroy-failures-to-failure-callback", preview_destroy["id"], build_failure_callback["id"], ["Failure", "No Retry", "Retry"])
+        ensure_connection(process_group_id, "prod-destroy-failures-to-failure-callback", prod_destroy["id"], build_failure_callback["id"], ["Failure", "No Retry", "Retry"])
+        ensure_connection(process_group_id, "success-callback-to-finish-platform-operation", build_success_callback["id"], finish_succeeded["id"], ["success"])
+        ensure_connection(process_group_id, "success-callback-failures-to-platform-deploy-dlq", build_success_callback["id"], dlq["id"], ["failure"])
+        ensure_connection(process_group_id, "finish-success-failures-to-platform-deploy-dlq", finish_succeeded["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+        ensure_connection(process_group_id, "failure-callback-to-finish-platform-operation", build_failure_callback["id"], finish_failed["id"], ["success"])
+        ensure_connection(process_group_id, "failure-callback-failures-to-platform-deploy-dlq", build_failure_callback["id"], dlq["id"], ["failure"])
+        ensure_connection(process_group_id, "finish-failed-original-to-platform-deploy-dlq", finish_failed["id"], dlq["id"], ["Original"])
+        ensure_connection(process_group_id, "finish-failed-failures-to-platform-deploy-dlq", finish_failed["id"], dlq["id"], ["Failure", "No Retry", "Retry"])
+
+      processors_to_start = [
         dlq,
         mark_running,
         set_auth,
         extract_metadata,
         consume,
-      ):
+      ]
+      if PLATFORM_DEPLOY_EXECUTION_ENABLED:
+        processors_to_start = [
+          dlq,
+          finish_failed,
+          build_failure_callback,
+          finish_succeeded,
+          build_success_callback,
+          route_after_destroy,
+          prod_destroy,
+          preview_destroy,
+          preview_deploy,
+          prod_deploy,
+          route_operation_type,
+          mark_running,
+          set_auth,
+          extract_metadata,
+          consume,
+        ]
+
+      for processor in processors_to_start:
         set_processor_state(processor, "RUNNING")
-      print(f"Platform deploy NiFi flow is configured and running in process group {process_group_id}.")
+      mode = "execution enabled" if PLATFORM_DEPLOY_EXECUTION_ENABLED else "handoff only"
+      print(f"Platform deploy NiFi flow is configured and running in process group {process_group_id} ({mode}).")
 
     if __name__ == "__main__":
       main()
@@ -678,6 +947,16 @@ spec:
                 configMapKeyRef:
                   name: platform-deploy-flow-config
                   key: platform_deploy_service_url
+            - name: PLATFORM_DEPLOY_EXECUTOR_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: platform_deploy_executor_url
+            - name: PLATFORM_DEPLOY_EXECUTION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: platform-deploy-flow-config
+                  key: execution_enabled
           command: ["python", "/bootstrap/bootstrap_flow.py"]
           volumeMounts:
             - name: bootstrap-script

@@ -7,8 +7,13 @@ Flow ownership:
 1. Consume prepared deployment requests from `batch.platform.deploy.prepared.v1`.
 2. Extract the platform app deployment operation metadata.
 3. Mark the operation as running through `platform-deploy-service`.
-4. Provide the NiFi process group where the long-running deployment orchestration steps will be added.
-5. Route orchestration failures to `batch.platform.deploy.prepared.dlq.v1`.
+4. Block executor calls unless `execution_enabled` is set to `"true"`.
+5. Route create operations through prod deploy first, then preview deploy.
+6. Route update/redeploy operations through preview destroy, prod destroy,
+   prod deploy, then preview deploy.
+7. Route destroy operations through preview destroy first, then prod destroy.
+8. Call back to `platform-deploy-service` to finish the operation.
+9. Route orchestration failures to `batch.platform.deploy.prepared.dlq.v1`.
 
 The app references the shared `dataflow/nifi-external` NiFi cluster but does
 not own that cluster or its TLS auth secret.
@@ -29,5 +34,26 @@ Required Vault values before first production sync:
 
 This project defines and configures the NiFi orchestration handoff. The platform
 deploy service submits the preparation job to Flink, and that Flink job publishes
-prepared deployment requests for this flow to consume. The Terraform/Cloudflare
-execution processors still need to be added to this flow.
+prepared deployment requests for this flow to consume.
+
+Execution boundary:
+
+- NiFi owns the visible workflow, sequencing, retries, and failure routing.
+- `platform-deploy-service` owns operation state in Directus.
+- A separate platform deploy executor service should own Terraform, Cloudflare,
+  shell build, workspace management, provider plugins, and other code-heavy
+  deployment modules.
+
+The current NiFi runtime bootstrap creates placeholder `InvokeHTTP` processors
+for the executor contract:
+
+- `POST /internal/operations/{operation_id}/steps/prod-deploy`
+- `POST /internal/operations/{operation_id}/steps/preview-deploy`
+- `POST /internal/operations/{operation_id}/steps/preview-destroy`
+- `POST /internal/operations/{operation_id}/steps/prod-destroy`
+
+Those endpoints are not implemented in this repository. The placeholder service
+URL is configured by `platform_deploy_executor_url` in
+`platform-deploy-flow-config`. Execution is disabled by default through
+`execution_enabled: "false"` so the flow can be deployed before the executor
+service exists.
