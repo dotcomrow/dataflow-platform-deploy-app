@@ -442,6 +442,7 @@ data:
         "flink-submit-failures-to-platform-deploy-dlq",
         "running-failures-to-platform-deploy-dlq",
         "running-original-to-route-platform-operation",
+        "prod-deploy-to-preview-deploy",
         "prod-destroy-to-success-callback",
       ):
         delete_connection_by_name(process_group_id, connection_name)
@@ -504,6 +505,14 @@ data:
         "nifi-standard-nar",
         1500,
         -180,
+      )
+      route_prod_deploy_success = ensure_processor(
+        process_group_id,
+        "route-prod-deploy-success",
+        "org.apache.nifi.processors.standard.RouteOnAttribute",
+        "nifi-standard-nar",
+        1800,
+        -320,
       )
       preview_deploy = ensure_processor(
         process_group_id,
@@ -585,6 +594,7 @@ data:
         mark_running,
         route_operation_type,
         prod_deploy,
+        route_prod_deploy_success,
         preview_deploy,
         preview_destroy,
         prod_destroy,
@@ -705,6 +715,14 @@ data:
         ],
         ["Response"],
       )
+      route_prod_deploy_success = configure_processor(
+        route_prod_deploy_success,
+        [
+          (["Routing Strategy"], "Route to Property name"),
+        ],
+        None,
+        [("succeeded", "${invokehttp.status.code:matches('2[0-9][0-9]')}")],
+      )
       preview_deploy = configure_processor(
         preview_deploy,
         [
@@ -822,7 +840,10 @@ data:
         ensure_connection(process_group_id, "deploy-route-to-prod-deploy", route_operation_type["id"], prod_deploy["id"], ["unmatched"])
         ensure_connection(process_group_id, "recreate-route-to-preview-destroy", route_operation_type["id"], preview_destroy["id"], ["recreate"])
         ensure_connection(process_group_id, "destroy-route-to-preview-destroy", route_operation_type["id"], preview_destroy["id"], ["destroy"])
-        ensure_connection(process_group_id, "prod-deploy-to-preview-deploy", prod_deploy["id"], preview_deploy["id"], ["Original"])
+        # Production owns shared resources such as D1 and R2; preview deploy must only run after prod deploy succeeds.
+        ensure_connection(process_group_id, "prod-deploy-to-success-route", prod_deploy["id"], route_prod_deploy_success["id"], ["Original"])
+        ensure_connection(process_group_id, "prod-deploy-success-to-preview-deploy", route_prod_deploy_success["id"], preview_deploy["id"], ["succeeded"])
+        ensure_connection(process_group_id, "prod-deploy-unmatched-to-failure-callback", route_prod_deploy_success["id"], build_failure_callback["id"], ["unmatched"])
         ensure_connection(process_group_id, "preview-deploy-to-success-callback", preview_deploy["id"], build_success_callback["id"], ["Original"])
         ensure_connection(process_group_id, "preview-destroy-to-prod-destroy", preview_destroy["id"], prod_destroy["id"], ["Original"])
         ensure_connection(process_group_id, "prod-destroy-to-route-after-destroy", prod_destroy["id"], route_after_destroy["id"], ["Original"])
@@ -858,6 +879,7 @@ data:
           prod_destroy,
           preview_destroy,
           preview_deploy,
+          route_prod_deploy_success,
           prod_deploy,
           route_operation_type,
           mark_running,

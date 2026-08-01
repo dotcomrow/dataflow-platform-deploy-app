@@ -8,7 +8,8 @@ Flow ownership:
 2. Extract the platform app deployment operation metadata.
 3. Mark the operation as running through `platform-deploy-service`.
 4. Block executor calls unless `execution_enabled` is set to `"true"`.
-5. Route create operations through prod deploy first, then preview deploy.
+5. Route create operations through prod deploy first, then preview deploy only
+   after the prod executor call returns successfully.
 6. Route update/redeploy operations through preview destroy, prod destroy,
    prod deploy, then preview deploy.
 7. Route destroy operations through preview destroy first, then prod destroy.

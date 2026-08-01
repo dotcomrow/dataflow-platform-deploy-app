@@ -96,6 +96,11 @@ data:
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
+          "name": "route-prod-deploy-success",
+          "type": "org.apache.nifi.processors.standard.RouteOnAttribute",
+          "relationships": ["succeeded", "unmatched"]
+        },
+        {
           "name": "invoke-platform-preview-deploy",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.executor.url}/internal/operations/${platform.operation_id}/steps/preview-deploy",
