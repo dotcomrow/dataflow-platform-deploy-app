@@ -29,8 +29,6 @@ spec:
   secretRefs:
     - name: platform-deploy-kafka-credentials
       namespace: dataflow
-    - name: platform-deploy-flow-secrets
-      namespace: dataflow
   parameters:
     - name: platform.kafka.bootstrap.servers
       value: kafka.kafka.svc.internal.lan:9092
@@ -259,53 +257,38 @@ spec:
                 exit 1
               fi
 
-              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
-              if [ "${code}" = "200" ]; then
-                echo "Flow version 1 already exists; nothing to do."
-                exit 0
-              fi
-              if [ "${code}" != "404" ]; then
-                echo "Unexpected response checking flow version 1: HTTP ${code}"
-                cat /tmp/resp.json || true
-                exit 1
-              fi
+              for version in 1 2 3; do
+                version_url="${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/${version}"
+                code="$(check_http GET "${version_url}")"
+                if [ "${code}" = "200" ]; then
+                  echo "Flow version ${version} already exists."
+                  continue
+                fi
+                if [ "${code}" != "404" ]; then
+                  echo "Unexpected response checking flow version ${version}: HTTP ${code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
 
-              cat > /tmp/flow-v1.json <<EOF
-              {
-                "snapshotMetadata": {
-                  "bucketIdentifier": "${NIFI_REGISTRY_BUCKET_ID}",
-                  "flowIdentifier": "${NIFI_REGISTRY_FLOW_ID}",
-                  "version": 1
-                },
-                "flowContents": {
-                  "identifier": "root-group",
-                  "name": "${NIFI_REGISTRY_FLOW_NAME}",
-                  "comments": "Initial platform app deployment orchestration flow snapshot",
-                  "processGroups": [],
-                  "remoteProcessGroups": [],
-                  "processors": [],
-                  "inputPorts": [],
-                  "outputPorts": [],
-                  "connections": [],
-                  "labels": [],
-                  "funnels": []
-                }
-              }
-              EOF
-
-              code="$(check_http POST "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" /tmp/flow-v1.json)"
-              if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
-                echo "Failed creating flow version 1: HTTP ${code}"
-                cat /tmp/resp.json || true
-                exit 1
-              fi
-
-              code="$(check_http GET "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/1")"
-              if [ "${code}" != "200" ]; then
-                echo "Flow version 1 was not found after bootstrap."
-                cat /tmp/resp.json || true
-                exit 1
-              fi
+                sed "s/\"__FLOW_VERSION__\"/${version}/" \
+                  /snapshot/flow-template.json > "/tmp/flow-v${version}.json"
+                code="$(check_http POST \
+                  "${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions" \
+                  "/tmp/flow-v${version}.json")"
+                if [ "${code}" != "200" ] && [ "${code}" != "201" ] && [ "${code}" != "409" ]; then
+                  echo "Failed creating flow version ${version}: HTTP ${code}"
+                  cat /tmp/resp.json || true
+                  exit 1
+                fi
+              done
+          volumeMounts:
+            - name: flow-snapshot
+              mountPath: /snapshot
+              readOnly: true
+      volumes:
+        - name: flow-snapshot
+          configMap:
+            name: platform-deploy-flow-snapshot
 ---
 apiVersion: nifi.konpyutaika.com/v1
 kind: NifiDataflow
@@ -316,14 +299,13 @@ metadata:
     argocd.argoproj.io/sync-wave: "66"
 spec:
   displayName: "platform-app-deploy"
-  parentProcessGroupID: "root"
   bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
   flowId: "46d4e1b6-e423-49c2-9b5f-636e9f12f171"
-  flowVersion: 1
+  flowVersion: 3
   flowPosition:
     posX: 800
-    posY: 0
-  syncMode: never
+    posY: 1
+  syncMode: always
   updateStrategy: drain
   skipInvalidControllerService: true
   skipInvalidComponent: true

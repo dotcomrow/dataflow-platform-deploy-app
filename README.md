@@ -24,7 +24,9 @@ The NiFi Registry flow ID is manifest-owned:
 - `46d4e1b6-e423-49c2-9b5f-636e9f12f171`
 
 The `platform-deploy-nifi-registry-bootstrap` Sync hook creates that Registry
-flow and version `1` if they do not already exist.
+flow and its Git-owned versions through version `3` if they do not already
+exist. The `NifiDataflow` pins version `3` with `syncMode: always`, so NiFiKop
+continuously reverts runtime drift to the Registry snapshot.
 
 Required Vault values before first production sync:
 
@@ -45,15 +47,15 @@ Execution boundary:
   shell build, workspace management, provider plugins, and other code-heavy
   deployment modules.
 
-The current NiFi runtime bootstrap creates placeholder `InvokeHTTP` processors
-for the executor contract:
+The versioned flow contains the `InvokeHTTP` processors for the executor
+contract:
 
 - `POST /internal/operations/{operation_id}/steps/prod-deploy`
 - `POST /internal/operations/{operation_id}/steps/preview-deploy`
 - `POST /internal/operations/{operation_id}/steps/preview-destroy`
 - `POST /internal/operations/{operation_id}/steps/prod-destroy`
 
-Those endpoints are not implemented in this repository. The placeholder service
-URL is configured by `platform_deploy_executor_url` in
-`platform-deploy-flow-config`. Execution is enabled through
-`execution_enabled: "true"` now that the executor service is deployed.
+The service URL is configured by `platform_deploy_executor_url` in
+`platform-deploy-flow-config`. Authorization is sourced at runtime from the
+NiFi pod environment; the Registry snapshot contains only the environment
+expression and never the bearer credential.
