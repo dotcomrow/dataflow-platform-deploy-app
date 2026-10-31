@@ -124,9 +124,17 @@ spec:
                   --create \
                   --topic "${topic}" \
                   --partitions 3 \
-                  --replication-factor 3
+                  --replication-factor 3 \
+                  --config min.insync.replicas=2
               }
 
               ensure_topic "${PLATFORM_DEPLOY_PREPARED_TOPIC}"
               ensure_topic "${PLATFORM_DEPLOY_DLQ_TOPIC}"
+              for topic in "${PLATFORM_DEPLOY_PREPARED_TOPIC}" "${PLATFORM_DEPLOY_DLQ_TOPIC}"; do
+                /opt/kafka/bin/kafka-configs.sh \
+                  --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
+                  --command-config "${CLIENT_CFG}" \
+                  --alter --entity-type topics --entity-name "${topic}" \
+                  --add-config min.insync.replicas=2
+              done
               echo "Platform deploy topics are ready."
