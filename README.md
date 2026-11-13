@@ -59,3 +59,9 @@ The service URL is configured by `platform_deploy_executor_url` in
 `platform-deploy-flow-config`. Authorization is sourced at runtime from the
 NiFi pod environment; the Registry snapshot contains only the environment
 expression and never the bearer credential.
+
+Executor calls use the `platform.deploy.executor.read.timeout` parameter. It
+must remain longer than the maximum end-to-end Terraform retry envelope so
+NiFi does not route a still-running executor request to failure. Terraform
+phase-stall detection belongs to the executor and is intentionally shorter;
+the NiFi timeout is a final transport safety boundary, not a run watchdog.

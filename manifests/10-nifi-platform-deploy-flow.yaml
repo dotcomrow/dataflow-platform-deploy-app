@@ -46,6 +46,8 @@ spec:
       value: http://platform-deploy-service.directus.svc.cluster.local:8080
     - name: platform.deploy.executor.url
       value: http://platform-deploy-executor.directus.svc.cluster.local:8080
+    - name: platform.deploy.executor.read.timeout
+      value: "8 hours"
     - name: platform.deploy.execution.enabled
       value: "true"
 ---
@@ -91,6 +93,7 @@ data:
           "name": "invoke-platform-prod-deploy",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.executor.url}/internal/operations/${platform.operation_id}/steps/prod-deploy",
+          "readTimeout": "#{platform.deploy.executor.read.timeout}",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
@@ -102,18 +105,21 @@ data:
           "name": "invoke-platform-preview-deploy",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.executor.url}/internal/operations/${platform.operation_id}/steps/preview-deploy",
+          "readTimeout": "#{platform.deploy.executor.read.timeout}",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
           "name": "invoke-platform-preview-destroy",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.executor.url}/internal/operations/${platform.operation_id}/steps/preview-destroy",
+          "readTimeout": "#{platform.deploy.executor.read.timeout}",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
           "name": "invoke-platform-prod-destroy",
           "type": "org.apache.nifi.processors.standard.InvokeHTTP",
           "url": "#{platform.deploy.executor.url}/internal/operations/${platform.operation_id}/steps/prod-destroy",
+          "readTimeout": "#{platform.deploy.executor.read.timeout}",
           "relationships": ["Response", "Failure", "Retry", "No Retry", "Original"]
         },
         {
@@ -257,7 +263,7 @@ spec:
                 exit 1
               fi
 
-              for version in 1 2 3; do
+              for version in 1 2 3 4; do
                 version_url="${NIFI_REGISTRY_API}/buckets/${NIFI_REGISTRY_BUCKET_ID}/flows/${NIFI_REGISTRY_FLOW_ID}/versions/${version}"
                 code="$(check_http GET "${version_url}")"
                 if [ "${code}" = "200" ]; then
@@ -301,7 +307,7 @@ spec:
   displayName: "platform-app-deploy"
   bucketId: "<path:secret/data/k8s-kafka-nifi-registry-bucket-id#value>"
   flowId: "46d4e1b6-e423-49c2-9b5f-636e9f12f171"
-  flowVersion: 3
+  flowVersion: 4
   flowPosition:
     posX: 800
     posY: 1
